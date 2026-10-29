@@ -3,4 +3,5 @@ node_modules/
 out/
 .env.local
 .env.*.local
+.env
 npm-debug.log*

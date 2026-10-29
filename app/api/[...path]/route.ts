@@ -90,21 +90,25 @@ async function get(request: NextRequest, endpoint: string) {
   const db = await database();
   if (endpoint === "me") { const user = await currentUser(request, db); return response(request, { user: user ? publicUser(user) : null }); }
   const user = await currentUser(request, db); if (!user) throw new HttpError(401, "Please sign in again.");
+  if (endpoint === "quran-goal") return response(request, { goal: user.quran_goal || 1 });
   if (endpoint === "data") {
-    const [prayerRows, rows] = await Promise.all([
+    const [prayerRows, rows, paraRows] = await Promise.all([
       db.collection("prayers").find({ user_id: user._id, prayed: true }, { projection: { _id: 0, date: 1, prayer: 1 } }).sort({ date: 1 }).toArray(),
       db.collection("quran_sessions").find({ user_id: user._id }).sort({ date: -1, created_at: -1 }).limit(1000).toArray(),
+      db.collection("quran_days").find({ user_id: user._id }).toArray(),
     ]);
     const prayers: Record<string,string[]> = {}; for (const row of prayerRows) (prayers[row.date] ||= []).push(row.prayer);
-    const sessions = rows.map(row => ({ id: String(row._id), date: row.date, surah: row.surah || "", pages: row.pages, minutes: row.minutes || 0 }));
-    return response(request, { user: publicUser(user), prayers, sessions });
+    const sessions = rows.map(row => ({ id: String(row._id), date: row.date, surah: row.surah || "", pages: row.pages, minutes: row.minutes || 0, para: row.para, portion: row.portion }));
+    const quranDays: Record<string, number[]> = {}; for (const row of paraRows) quranDays[row.date] = row.paras || [];
+    return response(request, { user: publicUser(user), prayers, sessions, quranDays, quranGoal: user.quran_goal || 1 });
   }
   if (endpoint === "export") {
-    const [prayers, rows] = await Promise.all([
+    const [prayers, rows, quranDays] = await Promise.all([
       db.collection("prayers").find({ user_id: user._id, prayed: true }, { projection: { _id: 0, date: 1, prayer: 1 } }).sort({ date: 1 }).toArray(),
       db.collection("quran_sessions").find({ user_id: user._id }).sort({ date: -1, created_at: -1 }).toArray(),
+      db.collection("quran_days").find({ user_id: user._id }).toArray(),
     ]);
-    return response(request, { user: publicUser(user), prayers, sessions: rows.map(row => ({ id: String(row._id), date: row.date, surah: row.surah || "", pages: row.pages, minutes: row.minutes || 0, created_at: row.created_at instanceof Date ? row.created_at.toISOString() : row.created_at })), exportedAt: new Date().toISOString() });
+    return response(request, { user: publicUser(user), prayers, quranDays, quranGoal: user.quran_goal || 1, sessions: rows.map(row => ({ id: String(row._id), date: row.date, surah: row.surah || "", pages: row.pages, minutes: row.minutes || 0, para: row.para, portion: row.portion, created_at: row.created_at instanceof Date ? row.created_at.toISOString() : row.created_at })), exportedAt: new Date().toISOString() });
   }
   throw new HttpError(404, "API endpoint not found.");
 }
@@ -178,18 +182,25 @@ async function patch(request: NextRequest, endpoint: string, body: Record<string
 async function deleteRequest(request: NextRequest, endpoint: string) {
   if(endpoint!=="data")throw new HttpError(404,"API endpoint not found.");
   const db=await database(), user=await currentUser(request,db); if(!user)throw new HttpError(401,"Please sign in again.");
-  await Promise.all([db.collection("prayers").deleteMany({user_id:user._id}),db.collection("quran_sessions").deleteMany({user_id:user._id})]); return response(request,{ok:true});
+  await Promise.all([db.collection("prayers").deleteMany({user_id:user._id}),db.collection("quran_sessions").deleteMany({user_id:user._id}),db.collection("quran_days").deleteMany({user_id:user._id}),db.collection("users").updateOne({_id:user._id},{$unset:{quran_goal:""}})]); return response(request,{ok:true});
 }
 async function postRecord(request:NextRequest,endpoint:string,body:Record<string,any>){
-  if(endpoint!=="prayers"&&endpoint!=="sessions")throw new HttpError(404,"API endpoint not found.");
+  if(endpoint!=="prayers"&&endpoint!=="sessions"&&endpoint!=="quran-days"&&endpoint!=="quran-goal")throw new HttpError(404,"API endpoint not found.");
   const db=await database(), user=await currentUser(request,db); if(!user)throw new HttpError(401,"Please sign in again.");
+  if(endpoint==="quran-goal") { const goal=body.goal; if(!Number.isInteger(goal)||goal<1||goal>120)throw new HttpError(400,"Daily goal must be between 1 and 30 paras (up to 120 quarter-paras)."); await db.collection("users").updateOne({_id:user._id},{$set:{quran_goal:goal}}); return response(request,{ok:true,goal}); }
+  if(endpoint==="quran-days") { const {date,paras}=body; if(!validDate(date)||!Array.isArray(paras)||paras.length>30||paras.some((n:any)=>!Number.isInteger(n)||n<1||n>30)||new Set(paras).size!==paras.length)throw new HttpError(400,"Choose valid Quran paras for this date."); const query={user_id:user._id,date}; if(paras.length)await db.collection("quran_days").updateOne(query,{$set:{paras}},{upsert:true});else await db.collection("quran_days").deleteOne(query); return response(request,{ok:true}); }
   if(endpoint==="prayers"){
     const {date,prayer,prayed}=body; if(!validDate(date)||!PRAYERS.has(prayer)||typeof prayed!=="boolean")throw new HttpError(400,"Provide a valid date, prayer and prayed status.");
     const query={user_id:user._id,date,prayer}; if(prayed)await db.collection("prayers").updateOne(query,{$set:{prayed:true}},{upsert:true});else await db.collection("prayers").deleteOne(query); return response(request,{ok:true});
   }
-  const {date,pages}=body, minutes=body.minutes??0, surah=body.surah??"";
+  const {date,pages}=body, minutes=body.minutes??0, surah=body.surah??"", para=body.para, portion=body.portion;
   if(!validDate(date)||!Number.isInteger(pages)||pages<1||pages>604||!Number.isInteger(minutes)||minutes<0||minutes>1440||typeof surah!=="string"||surah.trim().length>60)throw new HttpError(400,"Check the date, surah, pages and minutes and try again.");
-  const inserted=await db.collection("quran_sessions").insertOne({user_id:user._id,date,surah:surah.trim(),pages,minutes,created_at:new Date()}); return response(request,{id:String(inserted.insertedId),ok:true},201);
+  if(para!==undefined&&(!Number.isInteger(para)||para<1||para>30||!["quarter","half","full"].includes(portion)))throw new HttpError(400,"Choose a valid para and reading amount.");
+  if(para!==undefined&&(!Number.isInteger(para)||para<1||para>30||!["quarter","half","full"].includes(portion)))throw new HttpError(400,"Choose a valid para and reading amount.");
+  const sessionData={user_id:user._id,date,surah:surah.trim(),pages,minutes,...(para!==undefined?{para,portion}:{}),created_at:new Date()};
+  const inserted=para!==undefined ? (await db.collection("quran_sessions").findOneAndUpdate({user_id:user._id,date,para},{$set:sessionData},{upsert:true,returnDocument:"after"}))! : await db.collection("quran_sessions").insertOne(sessionData);
+  const sessionId="insertedId" in inserted ? String(inserted.insertedId) : String(inserted._id);
+  return response(request,{id:sessionId,ok:true},201);
 }
 
 async function dispatch(request: NextRequest, context: { params: Promise<{path:string[]}> }) {
@@ -201,7 +212,7 @@ async function dispatch(request: NextRequest, context: { params: Promise<{path:s
     if(request.method==="DELETE")return await deleteRequest(request,endpoint);
     const body=await bodyJson(request);
     if(request.method==="PATCH")return await patch(request,endpoint,body);
-    if(endpoint==="prayers"||endpoint==="sessions")return await postRecord(request,endpoint,body);
+    if(endpoint==="prayers"||endpoint==="sessions"||endpoint==="quran-days"||endpoint==="quran-goal")return await postRecord(request,endpoint,body);
     return await post(request,endpoint,body);
   } catch(error) {
     if(error instanceof HttpError)return response(request,{error:error.message},error.status);
